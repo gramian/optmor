@@ -18,8 +18,8 @@ function PV = optmor(P,A,B,C,D,F,T,R,X,U,S,q,y)
 %  F in R^N
 %
 % Parameters:
-%  (vector) P : prior mean of parameters
-%  (handle) A : function mapping parameters to system matrix
+%  (vector) P : parameter prior mean
+%  (matrix) A : system matrix (states x states) 
 %  (matrix) B : input matrix (states x inputs)
 %  (matrix) C : output matrix (outputs x states)
 %  (matrix) D : feed-forward matrix (outputs x inputs)
@@ -37,13 +37,15 @@ function PV = optmor(P,A,B,C,D,F,T,R,X,U,S,q,y)
 %               * optimization norm (0(=Inf),1,2,...)
 %               * orthogonalization type (QR=0,SVD=1)
 %               * integration order (1st=0,2nd=1)
+%               * regularization (l2=0,l1=1,tr=2,off=3)
 %  (matrix) y : experimental data (outputs x timesteps) {optional}
 %
 % Output:
-%  (matrix) P : Parameter Projection (reduced parameters x parameters)
-%  (matrix) V : State Projection (reduced states x states)
+%  (cell)  PV : Parameter, State Projections (reduced x full)
+%
+% Keywords: Model Reduction, Combined Reduction, Bayesian Inversion
+%
 %*
-
 
 warning off all 
 optflag = optimset('Display','off');
@@ -56,33 +58,34 @@ t = (T(3)-T(1))/h;
 N = sqrt(numel(A(P)));
 J = size(B,2);
 O = size(C,1);
-
+G = numel(P);
 
 %Fix lazy arguments
 if(B==0)        B = sparse(N,J);   end
 if(C==1)        C = speye(N);      end
 if(D==0)        D = sparse(O,J);   end
 
-if(nargin<8)    X = 0;             end
-if(nargin<9)    U = 1;             end
-if(nargin<10)   S = 1;             end
-if(nargin<11)   q = [0,0,0,0,0,0,0]; end
-if(nargin<12)   y = 0;             end
+if(nargin<9)    X = 0;             end
+if(nargin<10)   U = 1;             end
+if(nargin<11)   S = 1;             end
+if(nargin<12)   q = [0,0,0,0,0,0,0,0]; end
+if(nargin<13)   y = 0;             end
 
 if(numel(F)==1) F = F*ones(N,1);   end
 if(numel(X)==1) X = X*ones(N,1);   end
 if(numel(U)==1) U = U*[ones(J,1), sparse(J,t-1)]; end
-if(numel(S)==1) S = S*speye(numel(P)); end
+if(numel(S)==1) S = S*speye(G); end
+if(numel(q)<8)  q(8) = 0; end
 
 %Parameter Checks
-if(R>numel(P) || numel(P)<0) error('ERROR: Be serious!'); end
+%if(R>G || G<0) error('ERROR: Be serious!'); end
 if(N~=size(B,1))       error('ERROR: Dimension of state and input do not agree in matrix B!');         end
 if(N~=size(C,2))       error('ERROR: Dimension of state and output do not agree in matrix C!');        end
 if(N~=size(F,1))       error('ERROR: Dimension of state and source do not agree in vector F!');        end
 if(N~=size(X,1))       error('ERROR: Dimension of state and initial state do not agree in vector X!'); end
 if(J~=size(U,1))       error('ERROR: Inputs do not match input series!');                              end
 if(t~=size(U,2))       error('ERROR: Timeseries length does not match input length!');                 end
-if(size(S)~=[numel(P) numel(P)]) error('ERROR: Covariance dimensions do not match parameter count!');  end
+if(size(S)~=[G G]) error('ERROR: Covariance dimensions do not match parameter count!');  end
 
 
 %Precision from Covariance
@@ -90,7 +93,7 @@ S(S~=0) = 1.0./S(S~=0);
 
 
 %Init State Projection
-V = res(rk(A(P),B,speye(N),sparse(N,J),F,h,t,X,U,q(7)),q(2));
+V = res(ode(A(P),B,speye(N),sparse(N,J),F,h,t,X,U,q(7)),q(2));
 
 
 %Init Parameter Projection
@@ -106,14 +109,14 @@ end
 
 		%apply optimization to current problem
 		if(q(3)), Q = P; else, Q = 1.0; end
-		OBJ = @(p) obj(Q*p,A,B,C,D,F,h,t,X,U,S,V,q(5),q(4),q(7),y);
+		OBJ = @(p) obj(Q*p,A,B,C,D,F,h,t,X,U,S,V,q(5),q(4),q(7),q(8),y);
 		p = fminunc(OBJ,p,optflag);
 
 		%append projection matrices
-                 if(q(2)==3), Z = rk(V'*A(Q*p)*V,V'*B,V,sparse(N,J),V'*F,h,t,V'*X,U,q(7)); else Z = 0; end
-		w = res(rk(A(Q*p),B,speye(N),sparse(N,J),F,h,t,X,U,q(7))-Z,q(2));
+                 if(q(2)==3), Z = ode(V'*A(Q*p)*V,V'*B,V,sparse(N,J),V'*F,h,t,V'*X,U,q(7)); else Z = 0; end
+		w = res(ode(A(Q*p),B,speye(N),sparse(N,J),F,h,t,X,U,q(7))-Z,q(2));
 		a = p;
-		if(q(3)), a(size(P,1),1) = 0; p(I,1) = 0; end
+		if(q(3) && I<=G), a(size(P,1),1) = 0; p(I,1) = 0; end
 
 		if(q(6)),
 			P = orth([P a]);
@@ -128,19 +131,26 @@ end
 end
 
 %%%%%%%% OBJECTIVE %%%%%%%%
-function j = obj(p,A,B,C,D,F,h,t,X,U,S,V,L,M,O,Y)
+function j = obj(p,A,B,C,D,F,h,t,X,U,S,V,L,M,O,R,Y)
 
 	b = V'*B;
 	f = V'*F;
 	x = V'*X;
 	c = C*V;
 
-	y = rk(V'*A(p)*V,b,c,D,f,h,t,x,U,O);
+	y = ode(V'*A(p)*V,b,c,D,f,h,t,x,U,O);
 
-	j = p'*S*p;
+	switch(R)
+		case 0
+			j = p'*S*p;
+		case 1
+			j = sum(abs(S*p));
+		case 2
+			j = sum(svds(A(p)));
+	end
 
 	if(M==0 || M==1),
-		Z = rk(A(p),B,C,D,F,h,t,X,U,O);
+		Z = ode(A(p),B,C,D,F,h,t,X,U,O);
 		switch(L)
 			case 0,    j = j - max(sum((Z-y).^2));
 
@@ -180,7 +190,7 @@ function r = res(y,q)
 end
 
 %%%%%%%% INTEGRATOR %%%%%%%%
-function y = rk(A,B,C,D,F,h,T,x,u,O)
+function y = ode(A,B,C,D,F,h,T,x,u,O)
 
 	y(size(C,1),T) = 0;
 
@@ -190,11 +200,21 @@ function y = rk(A,B,C,D,F,h,T,x,u,O)
 				x = x + h*(A*x + B*u(:,t) + F);
 				y(:,t) = C*x + D*u(:,t);
 			end
-		otherwise
-			for t=1:T
-				x = x + h*(A*(x + 0.5*h*(A*x + B*u(:,t) + F)) + B*u(:,t) + F);
+		case 1
+			m = 0.5*h*(A*x + B*u(:,1) + F); 
+			x = x + h*(A*(m + x) + B*u(:,1) + F);
+			y = C*x + D*u(:,1);
+			for t=2:T
+				z = 0.5*h*(A*x + B*u(:,t) + F); 
+				x = x + 3.0*z - m;
 				y(:,t) = C*x + D*u(:,t);
-			end
+				m = z;
+			end			
+		case 2
+			for t=1:T
+				z = h*(A*x + B*u(:,t) + F);
+				x = x + 0.25*z + 0.75*h*(A*(x + (2.0/3.0)*z) + B*u(:,t) + F);
+				y(:,t) = C*x + D*u(:,t);
+			end			
 	end
 end
-
