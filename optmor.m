@@ -1,6 +1,6 @@
-function PV = optmor(P,A,B,C,D,F,T,R,X,U,S,q,y)
-% optmor (Version 1.0)
-% by Christian Himpe, 2013,2014 ( http://wwwmath.uni-muenster.de/u/himpe )
+function XP = optmor(A,B,C,D,F,T,R,x,u,q,k,nf,yd)
+% optmor (Version 1.1)
+% by Christian Himpe, 2013-2014 ( http://wwwmath.uni-muenster.de/u/himpe )
 % released under BSD 2-Clause License ( opensource.org/licenses/BSD-2-Clause )
 %
 % About:
@@ -18,203 +18,205 @@ function PV = optmor(P,A,B,C,D,F,T,R,X,U,S,q,y)
 %  F in R^N
 %
 % Parameters:
-%  (vector) P : parameter prior mean
-%  (matrix) A : system matrix (states x states) 
+%  (handle) A : returns system matrix: Ap = A(p) 
 %  (matrix) B : input matrix (states x inputs)
 %  (matrix) C : output matrix (outputs x states)
 %  (matrix) D : feed-forward matrix (outputs x inputs)
 %  (vector) F : source term (states x 1)
 %  (vector) T : timing [start,step,stop]
 %  (scalar) R : reduced state dimension or error bound
-%  (vector) X : initial value (states x 1)
-%  (matrix) U : input data (inputs x timesteps)
-%  (matrix) S : prior covariance matrix (parameters x parameters)
-%  (vector) q : configuration (6 x 1) {optional}
-%               * reduction target (Dimension=0,Error=1) 
-%               * state selection (POD=0,MEAN=1,LAST=2,POD-GREEDY=3)
-%               * use trust region (No=0,Yes=1)
-%               * use data driven reduction (No=0,Yes=1,Excl=2)
-%               * optimization norm (0(=Inf),1,2,...)
-%               * orthogonalization type (QR=0,SVD=1)
-%               * integration order (1st=0,2nd=1)
-%               * regularization (l2=0,l1=1,tr=2,off=3)
-%  (matrix) y : experimental data (outputs x timesteps) {optional}
+%  (vector) x : initial value (states x 1)
+%  (matrix) u : input data (inputs x timesteps)
+%  (matrix) k : prior covariance matrix (parameters x parameters)
+%  (vector) nf : configuration (12 x 1) {optional}
+% 		* reduction target (Dimension=0,Error=1) [not implemented yet]
+% 		* state residual (POD-GREEDY=0,POD=1,POD_ORTH=2)
+%		* optimization norm (INFTY=0,1=1,...)
+%		* param orthogonalization type (QR=0,SVD=1,ORTH=2)
+%		* number of state base additions
+%		* Parameter Regularization Coefficient beta
+%		* Data Regularization Parameter gamma
+%		* use Data-Driven Regularization
+%		* use Monte-Carlo Basis Enrichment
+%		* Integration Order (currently only 4-5)
+%		* Size of Monte-Carlo base
+%		* check Parameter Stability
+%  (matrix) yd : experimental data (outputs x timesteps) {optional}
 %
 % Output:
-%  (cell)  PV : Parameter, State Projections (reduced x full)
+%  (cell)  XP : State, Parameter Projections (reduced x full)
 %
 % Keywords: Model Reduction, Combined Reduction, Bayesian Inversion
 %
+% Cite:
+%	C. Himpe and M. Ohlberger;
+%	"Data-Driven Combined State and Parameter Reduction for Inverse Problems";
+%	Preprint arXiv.OC, : 2014
+%
 %*
 
-warning off all 
-optflag = optimset('Display','off');
+global gt; % only for benchmarking pruposes
+global gd; % only for benchmarking pruposes
 
-if(~isa(A,'function_handle')), N = sqrt(numel(P)); A = @(p) reshape(p,[N N]); end
+% seed randomizers
+randn('seed',1009);
+rand('seed',1009);
 
-%Extract Dimensions
+% Determine System Dimensions
 h = T(2);
 t = (T(3)-T(1))/h;
-N = sqrt(numel(A(P)));
+N = sqrt(numel(A(q)));
 J = size(B,2);
 O = size(C,1);
-G = numel(P);
-
-%Fix lazy arguments
-if(B==0)        B = sparse(N,J);   end
-if(C==1)        C = speye(N);      end
-if(D==0)        D = sparse(O,J);   end
-
-if(nargin<9)    X = 0;             end
-if(nargin<10)   U = 1;             end
-if(nargin<11)   S = 1;             end
-if(nargin<12)   q = [0,0,0,0,0,0,0,0]; end
-if(nargin<13)   y = 0;             end
-
-if(numel(F)==1) F = F*ones(N,1);   end
-if(numel(X)==1) X = X*ones(N,1);   end
-if(numel(U)==1) U = U*[ones(J,1), sparse(J,t-1)]; end
-if(numel(S)==1) S = S*speye(G); end
-if(numel(q)<8)  q(8) = 0; end
-
-%Parameter Checks
-%if(R>G || G<0) error('ERROR: Be serious!'); end
-if(N~=size(B,1))       error('ERROR: Dimension of state and input do not agree in matrix B!');         end
-if(N~=size(C,2))       error('ERROR: Dimension of state and output do not agree in matrix C!');        end
-if(N~=size(F,1))       error('ERROR: Dimension of state and source do not agree in vector F!');        end
-if(N~=size(X,1))       error('ERROR: Dimension of state and initial state do not agree in vector X!'); end
-if(J~=size(U,1))       error('ERROR: Inputs do not match input series!');                              end
-if(t~=size(U,2))       error('ERROR: Timeseries length does not match input length!');                 end
-if(size(S)~=[G G]) error('ERROR: Covariance dimensions do not match parameter count!');  end
+Q = numel(q);
 
 
-%Precision from Covariance
-S(S~=0) = 1.0./S(S~=0);
+% Set Up Parameter Mapping
+if(~isa(A,'function_handle')),
 
-
-%Init State Projection
-V = res(ode(A(P),B,speye(N),sparse(N,J),F,h,t,X,U,q(7)),q(2));
-
-
-%Init Parameter Projection
-switch(q(3))
-	case 0, p = P;
-
-	case 1, p = 1.0;
+	N = sqrt(Q);
+	A = @(p) reshape(p,[N N]);
 end
 
-	%Main Loop
-	for I=2:R
-		I;
 
-		%apply optimization to current problem
-		if(q(3)), Q = P; else, Q = 1.0; end
-		OBJ = @(p) obj(Q*p,A,B,C,D,F,h,t,X,U,S,V,q(5),q(4),q(7),q(8),y);
-		p = fminunc(OBJ,p,optflag);
+% Expand Lazy Arguments
+if(nargin<8),  x = 0; end;
+if(nargin<9),  u = 1; end;
+if(nargin<10), k = 1; end;
+if(nargin<11), nf = [0,0,0,0,0,0,0,0,0,0,0,0]; end;
+if(nargin<12), y = 0; end;
 
-		%append projection matrices
-                 if(q(2)==3), Z = ode(V'*A(Q*p)*V,V'*B,V,sparse(N,J),V'*F,h,t,V'*X,U,q(7)); else Z = 0; end
-		w = res(ode(A(Q*p),B,speye(N),sparse(N,J),F,h,t,X,U,q(7))-Z,q(2));
-		a = p;
-		if(q(3) && I<=G), a(size(P,1),1) = 0; p(I,1) = 0; end
+if(D==0), D = sparse(O,J); end;
+if(numel(F)==1), F = F*ones(N,1); end;
+if(numel(x)==1), x = x*ones(N,1); end;
+if(numel(u)==1), u = u*[ones(J,1), sparse(J,t-1)]; end;
+if(numel(k)==1), k = k*speye(numel(Q)); end;
+if(numel(nf)<12), nf(1,12) = 0; end;
 
-		if(q(6)),
-			P = orth([P a]);
-			V = orth([V w]);
-		else,
-			[P,TMP] = qr([P a],0);
-			[V,TMP] = qr([V w],0);
-		end;
+
+% Set Default Options
+if(nf(5)==0),  nf(5)  = 1; end;
+if(nf(6)==0),  bb = 0.1; else, bb = nf(6); end;
+if(nf(7)==0),  cc = 0.1; else, cc = nf(7); end;
+if(nf(11)==0), nf(11) = 2; end;
+
+
+% Compute Precision Matrix
+G = k;
+G(k~=0) = 1.0./k(k~=0);
+
+
+% Assemble Objective Function
+norm1 = @(m) h*sum(sqrt(sum(m.*m)));
+norm2 = @(m) h*sum(sum(m.*m));
+norm8 = @(m) max(sqrt(sum(m.*m)));
+normp = @(m) h*sum(sum(m.^nf(2)));
+
+if(nf(8)==0)
+	switch(nf(2))
+
+		case 0,    j = @(p,y) bb*(p'*G*p) - norm8(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y);
+
+		case 1,    j = @(p,y) bb*(p'*G*p) - norm1(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y);
+
+		case 2,    j = @(p,y) bb*(p'*G*p) - norm2(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y);
+
+		otherwise, j = @(p,y) bb*(p'*G*p) - normp(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y);
 	end
+else
+	switch(nf(2))
 
-	PV = {P,V};
+		case 0,    j = @(p,y) bb*(p'*G*p) - norm8(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y) + cc*norm8(yd-y);
+
+		case 1,    j = @(p,y) bb*(p'*G*p) - norm1(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y) + cc*norm1(yd-y);
+
+		case 2,    j = @(p,y) bb*(p'*G*p) - norm2(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y) + cc*norm2(yd-y);
+
+		otherwise, j = @(p,y) bb*(p'*G*p) - normp(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y) + cc*normp(yd-y);
+	end		
+end;
+
+
+% Init Projections
+X = prd(ode(A(q),B,speye(N),sparse(N,J),F,h,t,x,u,nf(10)),nf(5));
+P = 0.1*randn(Q,1)+q;
+p = q;
+
+XP = {X,P};
+
+gd(1,1,1) = toc(gt);	 % only for benchmarking pruposes
+
+
+% Main Loop
+for I=2:R,
+	br = X'*B;
+	fr = X'*F;
+	cr = C*X;
+	xr = X'*x;
+
+	if(nf(9)==1),
+		% Monte-Carlo Basis Enrichment
+		qq = 0.1*randn(Q,nf(11))+q*ones(1,nf(11));
+
+		PPqq = P*(P'*qq);
+		kk = fminunc(@(k) j(qq*k,ode(X'*A(PPqq*k)*X,br,cr,D,fr,h,t,xr,u,nf(10))),ones(nf(11),1)./nf(11) ,optimset('Display','off'));
+		p  = qq*kk;
+	else,
+		% Original Method
+		p = fminunc(@(k) j(k,ode(X'*A(P*(P'*k))*X,br,cr,D,fr,h,t,xr,u,nf(10))),q ,optimset('Display','off'));
+	end;
+
+	% Test Stability
+	if(eigs(A(p),1,'lr')>=0 && nf(12)), fprintf('8'); end
+
+	% Append State Projections
+	e = ode(A(p),B,speye(N),sparse(N,J),F,h,t,x,u,nf(10));
+	f = ode(X'*A(p)*X,br,X,sparse(N,J),fr,h,t,xr,u,nf(10));
+
+	switch(nf(3)),
+		case 0,
+			X = [X,prd(e-f,nf(5))];
+		case 1,
+			X = [X,prd(e,nf(5))];
+		case 2,
+			P = orth([X,prd(e,nf(5))]);
+	end;
+
+	% Append Parameter Projection
+	switch(nf(4)),
+		case 0,
+			[P,dummy] = qr([P,p],0);
+		case 1,
+			[P,dummy,dummy2] = svd([P,p],'econ');
+		case 2,
+			P = orth([P,p]);
+	end;
+
+	XP = [XP;{X,P}];
+
+	gd(1,1,I) = toc(gt);
+end;
+
 end
 
-%%%%%%%% OBJECTIVE %%%%%%%%
-function j = obj(p,A,B,C,D,F,h,t,X,U,S,V,L,M,O,R,Y)
 
-	b = V'*B;
-	f = V'*F;
-	x = V'*X;
-	c = C*V;
+%%%%%%%% PRINCIPAL DIRECTION %%%%%%%%
+function u = prd(x,n)
 
-	y = ode(V'*A(p)*V,b,c,D,f,h,t,x,U,O);
-
-	switch(R)
-		case 0
-			j = p'*S*p;
-		case 1
-			j = sum(abs(S*p));
-		case 2
-			j = sum(svds(A(p)));
-	end
-
-	if(M==0 || M==1),
-		Z = ode(A(p),B,C,D,F,h,t,X,U,O);
-		switch(L)
-			case 0,    j = j - max(sum((Z-y).^2));
-
-			case 1,    j = j - sum(sqrt(sum((Z-y).^2)));
-
-			case 2,    j = j - sum(sum((Z-y).^2));
-
-			otherwise, j = j - (sum(sum((Z-y).^L))).^(1.0/L);
-		end
-	end
-
-	if(M==1 || M==2)
-		switch(L)
-			case 0,    j = j + max(sum((Y-y).^2));
-
-			case 1,    j = j + sum(sqrt(sum((Y-y).^2)));
-
-			case 2,    j = j + sum(sum((Y-y).^2));
-
-			otherwise, j = j + (sum(sum((Y-y).^L))).^(1.0/L);
-		end
-	end
+	[u,D,V] = svds(x,n);
 end
 
-%%%%%%%% RESIDUAL %%%%%%%%
-function r = res(y,q)
+%%%%%%%% ODE SOLVER %%%%%%%%
+function y = ode(A,B,C,D,F,h,L,x,u,O)
 
-	switch(q)
-		case 0, [U D V] = svd(y,'econ'); r = U(:,1);
+	H = 1.0./h;
 
-		case 1, r = mean(y,2);
-
-		case 2, r = y(:,end);
-
-		case 3, [U D V] = svd(y,'econ'); r = U(:,1);
-	end
+	if(exist('OCTAVE_VERSION')),
+		f = @(y,t) A*y + B*u(:,1.0+min(round(t*H),L-1)) + F;
+		y = C*lsode(f,x,linspace(0,h*L,L))' + D*U;
+	else,
+		f = @(t,y) A*y + B*u(:,1.0+min(round(t*H),L-1)) + F;
+		y = C*deval( ode45(f,[0,h*L],x), linspace(0,h*L,L) ) + D*u;
+	end;
 end
 
-%%%%%%%% INTEGRATOR %%%%%%%%
-function y = ode(A,B,C,D,F,h,T,x,u,O)
-
-	y(size(C,1),T) = 0;
-
-	switch(O)
-		case 0
-			for t=1:T
-				x = x + h*(A*x + B*u(:,t) + F);
-				y(:,t) = C*x + D*u(:,t);
-			end
-		case 1
-			m = 0.5*h*(A*x + B*u(:,1) + F); 
-			x = x + h*(A*(m + x) + B*u(:,1) + F);
-			y = C*x + D*u(:,1);
-			for t=2:T
-				z = 0.5*h*(A*x + B*u(:,t) + F); 
-				x = x + 3.0*z - m;
-				y(:,t) = C*x + D*u(:,t);
-				m = z;
-			end			
-		case 2
-			for t=1:T
-				z = h*(A*x + B*u(:,t) + F);
-				x = x + 0.25*z + 0.75*h*(A*(x + (2.0/3.0)*z) + B*u(:,t) + F);
-				y(:,t) = C*x + D*u(:,t);
-			end			
-	end
-end
