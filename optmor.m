@@ -167,7 +167,7 @@ for I=2:R,
 	end;
 
 	% Test Stability
-	if(eigs(A(p),1,'lr')>=0 && nf(12)), fprintf('8'); end
+	if(nf(12) && eigs(A(p),1,'lr')>=0), fprintf('8'); end
 
 	% Append State Projections
 	e = ode(A(p),B,speye(N),sparse(N,J),F,h,t,x,u,nf(10));
@@ -203,7 +203,11 @@ end
 %%%%%%%% PRINCIPAL DIRECTION %%%%%%%%
 function u = prd(x,n)
 
-	[u,D,V] = svds(x,n);
+	if(exist('OCTAVE_VERSION')),
+		[U,D,V] = svd(x); u = U(:,1);
+        else
+		[u,D,V] = svds(x,n);
+	end;
 end
 
 %%%%%%%% ODE SOLVER %%%%%%%%
@@ -213,7 +217,7 @@ function y = ode(A,B,C,D,F,h,L,x,u,O)
 
 	if(exist('OCTAVE_VERSION')),
 		f = @(y,t) A*y + B*u(:,1.0+min(round(t*H),L-1)) + F;
-		y = C*lsode(f,x,linspace(0,h*L,L))' + D*U;
+		y = C*lsode(f,x,linspace(0,h*L,L))' + D*u;
 	else,
 		f = @(t,y) A*y + B*u(:,1.0+min(round(t*H),L-1)) + F;
 		y = C*deval( ode45(f,[0,h*L],x), linspace(0,h*L,L) ) + D*u;
