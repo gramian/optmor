@@ -1,226 +1,300 @@
-function XP = optmor(A,B,C,D,F,T,R,x,u,q,k,nf,yd)
-% optmor (Version 1.1)
-% by Christian Himpe, 2013-2014 ( http://wwwmath.uni-muenster.de/u/himpe )
+function XP = optmor(f,g,s,t,r,q,co,nf,ut,x0,yd)
+% optmor (Version 2.1)
+% by Christian Himpe, 2013-2015 ( http://wwwmath.uni-muenster.de/u/himpe )
 % released under BSD 2-Clause License ( opensource.org/licenses/BSD-2-Clause )
 %
-% About:
-%  optmor (OPTimization-based Model Order Reduction)
-%  reduces simultaneously parameters and states of
-%  of a dynamic system of the following type:
+% SYNTAX:
+%    W = optmor(f,g,s,t,r,q,[co],[nf],[ut],[x0],[yd]);
 %
-%  x' = Ax + Bu + F
-%  y  = Cx + Du
+% SUMMARY:
+%    optmor - optimization-based model order reduction,
+%    computation of empirical gramians for model reduction,
+%    system identification and uncertainty quantification.
+%    Enables gramian-based nonlinear model order reduction.
+%    Compatible with OCTAVE and MATLAB.
 %
-%  A in R^NxN
-%  B in R^NxM
-%  C in R^OxN
-%  D in R^OxM
-%  F in R^N
+% ARGUMENTS:
+%   (func handle)  f - system function handle; signature: xdot = f(x,u,p)
+%   (func handle)  g - output function handle; signature:    y = g(x,u,p)
+%        (vector)  s - system dimensions [inputs,states,outputs]
+%        (vector)  t - time discretization [start,step,stop]
+%        (scalar)  r - reduced order or error threshold
+%        (vector)  q - parameter
+%        (matrix,vector,scalar)  [co = 1] - covariance matrix
+%        (vector,scalar) [nf = 0] - options, 10 components:
+%            + Optimization Algorithm: fminunc(0), fminsearch(1), Custom Optimizer(-1)
+%            + Lasso Regularization Weight: default(0)
+%            + Tikhonov Regularization Weight: default(0)
+%            + Data-Driven Regularization Weight: default(0)
+%            + Monte-Carlo Basis Enrichment (Base Size)
+%            + Random Seed: none(0)
+%            + State-space trajectory selection: pod-greedy(0), pod(1), pca(2)
+%            + Add x States per Iteration
+%            + Orthogonalization Algorithm: orth(0), qr(1), svd(2)
+%            + Solver: IRK3(0), Custom Solver with handle(-1)
+%        (matrix,vector,scalar,handle)  ut
+%        (vector)  x0 - initial state
+%        (matrix)  yd - experimental data
 %
-% Parameters:
-%  (handle) A : returns system matrix: Ap = A(p) 
-%  (matrix) B : input matrix (states x inputs)
-%  (matrix) C : output matrix (outputs x states)
-%  (matrix) D : feed-forward matrix (outputs x inputs)
-%  (vector) F : source term (states x 1)
-%  (vector) T : timing [start,step,stop]
-%  (scalar) R : reduced state dimension or error bound
-%  (vector) x : initial value (states x 1)
-%  (matrix) u : input data (inputs x timesteps)
-%  (matrix) k : prior covariance matrix (parameters x parameters)
-%  (vector) nf : configuration (12 x 1) {optional}
-% 		* reduction target (Dimension=0,Error=1) [not implemented yet]
-% 		* state residual (POD-GREEDY=0,POD=1,POD_ORTH=2)
-%		* optimization norm (INFTY=0,1=1,...)
-%		* param orthogonalization type (QR=0,SVD=1,ORTH=2)
-%		* number of state base additions
-%		* Parameter Regularization Coefficient beta
-%		* Data Regularization Parameter gamma
-%		* use Data-Driven Regularization
-%		* use Monte-Carlo Basis Enrichment
-%		* Integration Order (currently only 4-5)
-%		* Size of Monte-Carlo base
-%		* check Parameter Stability
-%  (matrix) yd : experimental data (outputs x timesteps) {optional}
+% RETURNS:
+%              (cell)  XP - {State-,Parameter-} Projection
 %
-% Output:
-%  (cell)  XP : State, Parameter Projections (reduced x full)
+% CITATION:
+%    C. Himpe (2015). optmor - Optimization-Based Model Order Reduction (Version 2.1)
+%    [Computer Software]. Available from http://???
 %
-% Keywords: Model Reduction, Combined Reduction, Bayesian Inversion
-%
-% Cite:
-%	C. Himpe and M. Ohlberger;
-%	"Data-Driven Combined State and Parameter Reduction for Inverse Problems";
-%	Preprint arXiv.OC, : 2014
-%
+% KEYWORDS:
+%    model reduction, combined reduction, greedy
 %*
 
-global gt; % only for benchmarking pruposes
-global gd; % only for benchmarking pruposes
+    % Version Info
+    if(nargin==1 && strcmp(f,'version')), XP = 2.1; return; end;
 
-% seed randomizers
-randn('seed',1009);
-rand('seed',1009);
+    % Default Arguments
+    if(nargin<7  || isempty(co)), co = 1; end; % Assume unit covariance
+    if(nargin<8  || isempty(nf)), nf = 0; end; % Assume default options
+    if(nargin<9  || isempty(ut)), ut = 1; end; % Assume impulse input
+    if(nargin<10 || isempty(x0)), x0 = 0; end; % Assume zero initial state
+    if(nargin<11 || isempty(yd)), yd = 0; end; % Assume no experimental data
 
-% Determine System Dimensions
-h = T(2);
-t = (T(3)-T(1))/h;
-N = sqrt(numel(A(q)));
-J = size(B,2);
-O = size(C,1);
-Q = numel(q);
+    % System Constants
+    J = s(1); % Number of inputs
+    N = s(2); % Number of states
+    O = s(3); % Number of outputs
 
+    h = t(2); % Time step width
+    T = round((t(3)-t(1))/h); % Number of time steps
+    r = abs(r); % Ensure positivity
+    Q = numel(q); % Number of parameters
 
-% Set Up Parameter Mapping
-if(~isa(A,'function_handle')),
+    % Discretize Procedural Input
+    if(isa(ut,'function_handle'))
+        uf = ut;
+        ut = zeros(J,T);
+        for l=1:T
+            ut(:,l) = uf(l*h);
+        end;
+    end;
 
-	N = sqrt(Q);
-	A = @(p) reshape(p,[N N]);
-end
+%% LAZY ARGUMENTS
 
+    if(numel(co)==1), co = co*ones(Q,1); end
+    if(numel(nf)==1), nf = zeros(1,12); end
+    if(numel(ut)==1), ut = [ut*ones(J,1),sparse(J,T-1)]; end
+    if(numel(x0)==1), x0 = x0*ones(N,1); end
 
-% Expand Lazy Arguments
-if(nargin<8),  x = 0; end;
-if(nargin<9),  u = 1; end;
-if(nargin<10), k = 1; end;
-if(nargin<11), nf = [0,0,0,0,0,0,0,0,0,0,0,0]; end;
-if(nargin<12), y = 0; end;
+%% SETUP
 
-if(D==0), D = sparse(O,J); end;
-if(numel(F)==1), F = F*ones(N,1); end;
-if(numel(x)==1), x = x*ones(N,1); end;
-if(numel(u)==1), u = u*[ones(J,1), sparse(J,t-1)]; end;
-if(numel(k)==1), k = k*speye(numel(Q)); end;
-if(numel(nf)<12), nf(1,12) = 0; end;
+    % SET ABORT CRITERIA
+    if(r >= 1)
+        n = r;
+    else
+        n = N;
+    end
 
+    % SET DEFAULT TIKHONOV REGULARIZATION
+    if(nf(3)==0),
+        nf(3) = 0.5;
+    end
 
-% Set Default Options
-if(nf(5)==0),  nf(5)  = 1; end;
-if(nf(6)==0),  bb = 0.1; else, bb = nf(6); end;
-if(nf(7)==0),  cc = 0.1; else, cc = nf(7); end;
-if(nf(11)==0), nf(11) = 2; end;
+    % CHECK FOR DATA
+    if(nf(4) && ( (numel(yd)==1 && yd==0) || size(yd,1)~=O || size(yd,2)~=T) ),
+        error('ERROR! optmor: yd data dimension mismatch!');
+    end;
 
+    % SET MINIMUM MONTE-CARLO BASE SIZE
+    if(nf(5)),
+        nf(5) = max(2,round(nf(5)));
+    end
 
-% Compute Precision Matrix
-G = k;
-G(k~=0) = 1.0./k(k~=0);
+    % SEED RANDOMIZERS
+    if(nf(6)),
+        rand('seed',nf(6));
+        randn('seed',nf(6));
+    end;
 
+    % SET MINIMUM STATE PRINCIPAL COMPONENTS
+    if(nf(8)==0),
+         nf(8) = 1;
+    end
 
-% Assemble Objective Function
-norm1 = @(m) h*sum(sqrt(sum(m.*m)));
-norm2 = @(m) h*sum(sum(m.*m));
-norm8 = @(m) max(sqrt(sum(m.*m)));
-normp = @(m) h*sum(sum(m.^nf(2)));
+    % Precision Matrix
+    if(size(co,2)==1),
+        W = spdiags(1.0./co,0,Q,Q);
+    else,
+        W = pinv(full(co));
+    end
 
-if(nf(8)==0)
-	switch(nf(2))
+    switch(nf(10)) % ODE Integrator
 
-		case 0,    j = @(p,y) bb*(p'*G*p) - norm8(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y);
+        case 0, % IRK3
+            ode = @irk3;
 
-		case 1,    j = @(p,y) bb*(p'*G*p) - norm1(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y);
+        case -1, % Custom
+            global CUSTOM_ODE;
+            ode = CUSTOM_ODE;
+    end
 
-		case 2,    j = @(p,y) bb*(p'*G*p) - norm2(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y);
+%% OBJECTIVE FUNCTIONAL SETUP
 
-		otherwise, j = @(p,y) bb*(p'*G*p) - normp(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y);
-	end
-else
-	switch(nf(2))
+    b1 = nf(2);
+    b2 = nf(3);
+    bd = nf(4);
 
-		case 0,    j = @(p,y) bb*(p'*G*p) - norm8(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y) + cc*norm8(yd-y);
+    if(b1==0 && b2==0 && bd==0), reg = 0; end; %  NONE
 
-		case 1,    j = @(p,y) bb*(p'*G*p) - norm1(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y) + cc*norm1(yd-y);
+    if(b1~=0 && b2==0 && bd==0), reg = @(p,y) b1*norm1w(p,W); end % L1
 
-		case 2,    j = @(p,y) bb*(p'*G*p) - norm2(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y) + cc*norm2(yd-y);
+    if(b1==0 && b2~=0 && bd==0), reg = @(p,y) b2*norm2w(p,W); end; % L2
 
-		otherwise, j = @(p,y) bb*(p'*G*p) - normp(ode(A(p),B,C,D,F,h,t,x,u,nf(10))-y) + cc*normp(yd-y);
-	end		
-end;
+    if(b1==0 && b2==0 && bd~=0), reg = @(p,y) bd*norm2t(yd-y,h); end; % DD
 
+    if(b1~=0 && b2~=0 && bd==0), reg = @(p,y) b1*norm1w(p,W) + b2*norm2w(p,W); end; % L1 + L2
 
-% Init Projections
-X = prd(ode(A(q),B,speye(N),sparse(N,J),F,h,t,x,u,nf(10)),nf(5));
-P = 0.1*randn(Q,1)+q;
-p = q;
+    if(b1~=0 && b2==0 && bd~=0), reg = @(p,y) b1*norm1w(p,W) + bd*norm2t(yd-y,h); end % L1 + DD
 
-XP = {X,P};
+    if(b1==0 && b2~=0 && bd~=0), reg = @(p,y) b2*norm2w(p,W) + bd*norm2t(yd-y,h); end; % L2 + DD
 
-gd(1,1,1) = toc(gt);	 % only for benchmarking pruposes
+    if(b1~=0 && b2~=0 && bd~=0), reg = @(p,y) b1*norm1w(p,W) + b2*norm2w(p,W) + bd*norm2t(yd-y,h); end; % L1 + L2 + DD
 
+%% MAIN LOOP
 
-% Main Loop
-for I=2:R,
-	br = X'*B;
-	fr = X'*F;
-	cr = C*X;
-	xr = X'*x;
+    % Set Initial Parameter
+    p = q;
+    P = p;
 
-	if(nf(9)==1),
-		% Monte-Carlo Basis Enrichment
-		qq = 0.1*randn(Q,nf(11))+q*ones(1,nf(11));
+    % Compute Trajectory for Initial Parameter
+    z = ode(f,1,h,T,x0,ut,p);
+    X = prn(z,nf(7),nf(8),1);
 
-		PPqq = P*(P'*qq);
-		kk = fminunc(@(k) j(qq*k,ode(X'*A(PPqq*k)*X,br,cr,D,fr,h,t,xr,u,nf(10))),ones(nf(11),1)./nf(11) ,optimset('Display','off'));
-		p  = qq*kk;
-	else,
-		% Original Method
-		p = fminunc(@(k) j(k,ode(X'*A(P*(P'*k))*X,br,cr,D,fr,h,t,xr,u,nf(10))),q ,optimset('Display','off'));
-	end;
+    opt = optimset('Display','off');
 
-	% Test Stability
-	if(nf(12) && eigs(A(p),1,'lr')>=0), fprintf('8'); end
+    for I=2:n
 
-	% Append State Projections
-	e = ode(A(p),B,speye(N),sparse(N,J),F,h,t,x,u,nf(10));
-	f = ode(X'*A(p)*X,br,X,sparse(N,J),fr,h,t,xr,u,nf(10));
+        fr = @(x,u,p) X'*f(X*x,u,p);
+        gr = @(x,u,p) g(X*x,u,p);
+        x0r = X'*x0;
+        mmz = @(p,y) reg(p,y) - norm2t(y-ode(f,g,h,T,x0,ut,p),h);
 
-	switch(nf(3)),
-		case 0,
-			X = [X,prd(e-f,nf(5))];
-		case 1,
-			X = [X,prd(e,nf(5))];
-		case 2,
-			P = orth([X,prd(e,nf(5))]);
-	end;
-
-	% Append Parameter Projection
-	switch(nf(4)),
-		case 0,
-			[P,dummy] = qr([P,p],0);
-		case 1,
-			[P,dummy,dummy2] = svd([P,p],'econ');
-		case 2,
-			P = orth([P,p]);
-	end;
-
-	XP = [XP;{X,P}];
-
-	gd(1,1,I) = toc(gt);
-end;
-
-end
-
-
-%%%%%%%% PRINCIPAL DIRECTION %%%%%%%%
-function u = prd(x,n)
-
-	if(exist('OCTAVE_VERSION')),
-		[U,D,V] = svd(x); u = U(:,1);
+        if(nf(5))
+            mc = orth(rand(Q,nf(5)));
+            p = ones(nf(5),1); % mc\q;
+            J = @(p) mmz(mc*p,ode(fr,gr,h,T,x0r,ut,P*P'*mc*p));
         else
-		[u,D,V] = svds(x,n);
-	end;
+            p = q;
+            J = @(p) mmz(p,ode(fr,gr,h,T,x0r,ut,P*P'*p));
+        end
+
+        switch(nf(1)) % Greedy Sampling Algorithm
+
+            case 0, % Unconstrained (Quasi-Newton)
+                p = fminunc(J,p,opt);
+
+            case 1, % Derivative-Free (Nelder-Mead)
+                p = fminsearch(J,p,opt);
+
+            case -1, % Custom Optimizer
+                global CUSTOM_OPT;
+                p = CUSTOM_OPT(J,p);
+        end
+
+        if(nf(5)), p = mc*p; end;
+        P = inc([P,p],nf(9));
+
+        z = ode(f,1,h,T,x0,ut,p);
+        z = z - X*(X'*z);
+        x = prn(z,nf(7),nf(8),1);
+        X = ([X,x]);
+
+        if(mod(I,100)==0) fprintf('#'); elseif(mod(I,10)==0), fprintf('+'); else, fprintf('|'); end;
+
+        if(r<1.0)
+            yf = ode(f,g,h,T,x0,ut,q);
+            yr = ode(@(x,u,p) X'*f(X*x,u,p),@(x,u,p) g(X*x,u,p),h,T,X'*x0,ut,P*(P'*q));
+            if(norm2t(yf-yr,h)/norm2t(yf,h) < r), break; end;
+        end
+    end
+
+    XP = {X,P};
 end
 
-%%%%%%%% ODE SOLVER %%%%%%%%
-function y = ode(A,B,C,D,F,h,L,x,u,O)
 
-	H = 1.0./h;
+%% ======== SQUARED NORMS ========
+function x = norm2t(X,h)
 
-	if(exist('OCTAVE_VERSION')),
-		f = @(y,t) A*y + B*u(:,1.0+min(round(t*H),L-1)) + F;
-		y = C*lsode(f,x,linspace(0,h*L,L))' + D*u;
-	else,
-		f = @(t,y) A*y + B*u(:,1.0+min(round(t*H),L-1)) + F;
-		y = C*deval( ode45(f,[0,h*L],x), linspace(0,h*L,L) ) + D*u;
-	end;
+    x = h*sum(X(:).*X(:));
+end
+
+function x = norm1w(X,w)
+
+    x = sum(abs(w*X));
+end
+
+function x = norm2w(X,w)
+
+    x = X'*X; %(X'*w')*(w*X);
+end
+
+function x = norm2(X)
+
+     x = X'*X;
+end
+
+%% ======== STATE-SELECT ========
+function v = prn(u,o,s,w)
+
+    switch(o)
+        case 1, % PCA
+            [v,dummy,dummy2] = svds(bsxfun(@minus,u,mean(u,2),s));
+
+        case 2, % Weighted POD
+            [v,dummy,dummy2] = svds(w*u,s);
+
+        otherwise, % = case 0, % POD
+            [v,dummy,dummy2] = svds(u,s);
+    end;
+end
+
+
+%% ======== INCORPORATE ========
+function v = inc(u,o)
+
+    switch(o)
+        case 1, % QR
+            [v,dummy] = qr(u,0);
+
+        case 2, % SVD
+            [v,dummy,dummy2] = svd(u,'econ');
+
+        otherwise, % ORTH
+            v = orth(u);
+    end;
+end
+
+%% ======== DEFAULT ODE INTEGRATOR ========
+function x = irk3(f,g,h,T,z,u,p)
+
+    if(isnumeric(g) && g==1), g = @(x,u,p) x; end;
+
+    k1 = h*f(z,u(:,1),p); % 2nd Order Midpoint RK2 for starting value
+    k2 = h*f(z + 0.5*k1,u(:,1),p);
+    z = z + k2;
+    x(:,1) = g(z,u(:,1),p);
+
+    x(end,T) = 0; % preallocate trajectory
+
+    k1 = h*f(z,u(:,2),p); % 2nd start value (improves impulse response)
+    k2 = h*f(z + 0.5*k1,u(:,2),p);
+    z = z + k2;
+    x(:,2) = g(z,u(:,2),p);
+
+    for t=3:T % 3rd Order Improved Runge-Kutta IRK3
+        l1 = h*f(z,u(:,t),p);
+        l2 = h*f(z + 0.5*l1,u(:,t),p);
+        z = z + (2.0/3.0)*l1 + (1.0/3.0)*k1 + (5.0/6.0)*(l2 - k2);
+        x(:,t) = g(z,u(:,t),p);
+        k1 = l1;
+        k2 = l2;
+    end;
 end
 
