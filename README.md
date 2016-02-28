@@ -95,7 +95,7 @@ About Info Usage: `v = optmor('version');`
 
 ## References
 
-* C. Himpe, M. Ohlberger; "[Data-driven combined state and parameter reduction for inverse problems](http://dx.doi.org/10.1007/s10444-015-9420-5)"; Advances in Computational Mathematics 41(5): 1343--1364, 2015; [Preprint](), [Source](), [Runmycode]().
+* C. Himpe, M. Ohlberger; "[Data-driven combined state and parameter reduction for inverse problems](http://dx.doi.org/10.1007/s10444-015-9420-5)"; Advances in Computational Mathematics 41(5): 1343--1364, 2015.
     + One-Sentence Abstract: Extensions for combined state and parameter reduction for inverse problems.
 
 
@@ -103,14 +103,14 @@ About Info Usage: `v = optmor('version');`
 
 * Cite as:
 
-    C. Himpe (2016). optmor - Optimization-Based Model Order Reduction (Version 2.5) [Software]. http://gramian.de
+    C. Himpe (2016). optmor - Optimization-Based Model Order Reduction (Version 2.5) [Software]. http://gramian.github.io/optmor
 
 * BibTeX:
 
         @MISC{optmor,
          author = {C. Himpe},
          title = {{optmor} - Optimization-Based Model Order Reduction (Version 2.5)},
-         howpublished = {\url{http://gramian.de}},
+         howpublished = {\url{http://gramian.github.io/optmor}},
          year = {2016}
         }
 * DOI: [10.5281/zenodo.46683](http://dx.doi.org/10.5281/zenodo.46683) (Version 2.5)
